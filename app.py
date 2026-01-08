@@ -4,7 +4,9 @@ import base64
 from typing import Optional, Dict, Any
 
 import numpy as np
+import cv2
 from PIL import Image
+from scipy.io import loadmat
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +31,7 @@ HF_REPO_ID = os.getenv("HF_REPO_ID", "")
 HF_FILENAME = os.getenv("HF_FILENAME", "best.pt")
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# Prevent Ultralytics config permission issue on Railway/containers
+# Prevent Ultralytics permission issue
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 # ======================================================
@@ -49,18 +51,14 @@ app.add_middleware(
 model: Optional[YOLO] = None
 model_error: Optional[str] = None
 
-
 # ======================================================
 # MODEL LOADING (SAFE)
 # ======================================================
 
 def load_model():
-    """Download + load model. Must not crash server if it fails."""
     global model, model_error
-
     if model is not None:
         return
-
     try:
         if not HF_REPO_ID:
             raise RuntimeError("HF_REPO_ID is not set")
@@ -76,18 +74,17 @@ def load_model():
 
         model = YOLO(model_path)
         model_error = None
-        print("[PulmoLens] Model loaded successfully:", model_path)
+        print("[PulmoLens] Model loaded:", model_path)
 
     except Exception as e:
         model = None
         model_error = str(e)
-        print(f"[PulmoLens] Model load failed: {model_error}")
+        print("[PulmoLens] Model load failed:", model_error)
 
 
 @app.on_event("startup")
 def startup_event():
     load_model()
-
 
 # ======================================================
 # UTILITIES
@@ -147,16 +144,14 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
-def masks_from_ultralytics(result) -> Optional[np.ndarray]:
-    # returns HxW uint8 mask (0/1) or None
+def masks_from_ultralytics(result) -> np.ndarray:
     if result.masks is None or result.masks.data is None:
-        return None
-    m = result.masks.data.cpu().numpy()  # (N, H, W)
+        return np.zeros(result.orig_shape, dtype=np.uint8)
+    m = result.masks.data.cpu().numpy()
     return (m.sum(axis=0) > 0).astype(np.uint8)
 
 
 def confidence_from_result(result) -> Optional[float]:
-    # quick summary confidence: max box confidence if exists
     try:
         if result.boxes is None or result.boxes.conf is None:
             return None
@@ -169,24 +164,64 @@ def confidence_from_result(result) -> Optional[float]:
 
 
 def read_gt_mask_as_binary(gt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    """
-    Reads GT mask image, converts to binary, and resizes to match pred mask.
-    target_hw: (H, W)
-    """
     gt_img = Image.open(io.BytesIO(gt_bytes)).convert("L")
-
-    # Resize with NEAREST to avoid destroying labels
     if gt_img.size != (target_hw[1], target_hw[0]):
-        gt_img = gt_img.resize((target_hw[1], target_hw[0]), resample=Image.NEAREST)
+        gt_img = gt_img.resize((target_hw[1], target_hw[0]), Image.NEAREST)
+    return (np.array(gt_img) > 127).astype(np.uint8)
 
-    gt_arr = np.array(gt_img)
 
-    # Robust binarization:
-    # If mask is inverted (lesion=0, background=255), user should fix input,
-    # but we can still threshold normally here.
-    gt_bin = (gt_arr > 127).astype(np.uint8)
-    return gt_bin
+def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+    H, W = target_hw
+    mask = np.zeros((H, W), dtype=np.uint8)
 
+    text = gt_txt_bytes.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return mask
+
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+
+        coords = parts[1:]
+        if len(coords) % 2 != 0:
+            continue
+
+        pts = []
+        for i in range(0, len(coords), 2):
+            x = float(coords[i])
+            y = float(coords[i + 1])
+            px = int(round(x * (W - 1)))
+            py = int(round(y * (H - 1)))
+            pts.append([px, py])
+
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
+
+    return mask
+
+
+def read_gt_mat_as_binary(gt_mat_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+    H, W = target_hw
+    m = loadmat(io.BytesIO(gt_mat_bytes))
+
+    candidate = None
+    for k, v in m.items():
+        if k.startswith("__"):
+            continue
+        if isinstance(v, np.ndarray) and v.ndim == 2:
+            candidate = v
+            break
+
+    if candidate is None:
+        raise HTTPException(status_code=400, detail="MAT read failed: no 2D mask found")
+
+    gt = (candidate > 0).astype(np.uint8)
+
+    if gt.shape != (H, W):
+        gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    return gt
 
 # ======================================================
 # ROUTES
@@ -205,8 +240,10 @@ def health():
 async def predict(
     file: UploadFile = File(...),
     gt_mask: Optional[UploadFile] = File(None),
+    gt_txt: Optional[UploadFile] = File(None),
+    gt_mat: Optional[UploadFile] = File(None),
     filename: str = Form("input"),
-    include_images: bool = Query(False, description="Return base64 PNGs if true"),
+    include_images: bool = Query(False),
 ):
     global model
 
@@ -227,29 +264,36 @@ async def predict(
     else:
         img_pil = read_png_like(raw)
 
-    img_np = np.array(img_pil)  # HxWx3
+    img_np = np.array(img_pil)
 
     try:
         res = model(img_np, conf=CONF_THRES, verbose=False)[0]
     except Exception as e:
-        return JSONResponse({"status": "error", "error": f"Inference failed: {e}"}, status_code=500)
+        return JSONResponse(
+            {"status": "error", "error": f"Inference failed: {e}"},
+            status_code=500,
+        )
 
     pred_mask = masks_from_ultralytics(res)
-    if pred_mask is None:
-        pred_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
-
     conf = confidence_from_result(res)
 
     payload: Dict[str, Any] = {
         "filename": file.filename or filename,
-        "has_gt": gt_mask is not None,
+        "has_gt": any([gt_mask, gt_txt, gt_mat]),
         "confidence": conf,
         "iou": None,
     }
 
-    if gt_mask is not None:
-        gt_raw = await gt_mask.read()
-        gt_bin = read_gt_mask_as_binary(gt_raw, target_hw=pred_mask.shape)
+    gt_bin = None
+
+    if gt_mask:
+        gt_bin = read_gt_mask_as_binary(await gt_mask.read(), pred_mask.shape)
+    elif gt_txt:
+        gt_bin = read_gt_txt_yolo_seg_as_binary(await gt_txt.read(), pred_mask.shape)
+    elif gt_mat:
+        gt_bin = read_gt_mat_as_binary(await gt_mat.read(), pred_mask.shape)
+
+    if gt_bin is not None:
         payload["iou"] = compute_iou(pred_mask, gt_bin)
 
     if include_images:
