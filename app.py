@@ -1,11 +1,12 @@
 import os
 import io
 import base64
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -28,7 +29,7 @@ HF_REPO_ID = os.getenv("HF_REPO_ID", "")
 HF_FILENAME = os.getenv("HF_FILENAME", "best.pt")
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# Prevent Ultralytics config permission issue
+# Prevent Ultralytics config permission issue on Railway/containers
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 # ======================================================
@@ -48,15 +49,13 @@ app.add_middleware(
 model: Optional[YOLO] = None
 model_error: Optional[str] = None
 
+
 # ======================================================
 # MODEL LOADING (SAFE)
 # ======================================================
 
 def load_model():
-    """
-    Download + load model.
-    Server MUST NOT crash if this fails.
-    """
+    """Download + load model. Must not crash server if it fails."""
     global model, model_error
 
     if model is not None:
@@ -77,17 +76,18 @@ def load_model():
 
         model = YOLO(model_path)
         model_error = None
-        print("[PulmoLens] Model loaded successfully")
+        print("[PulmoLens] Model loaded successfully:", model_path)
 
     except Exception as e:
         model = None
         model_error = str(e)
         print(f"[PulmoLens] Model load failed: {model_error}")
 
+
 @app.on_event("startup")
 def startup_event():
-    # Try load at startup, but DO NOT crash server
     load_model()
+
 
 # ======================================================
 # UTILITIES
@@ -98,11 +98,13 @@ def pil_to_b64_png(img: Image.Image) -> str:
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+
 def read_png_like(file_bytes: bytes) -> Image.Image:
     try:
         return Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file")
+
 
 def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
     try:
@@ -126,6 +128,7 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"DICOM read failed: {e}")
 
+
 def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(255, 180, 0), alpha=0.35):
     out = rgb.copy()
     m = mask.astype(bool)
@@ -135,6 +138,7 @@ def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(255, 180, 0), alpha=0
         out = (out * (1 - alpha) + overlay * alpha).astype(np.uint8)
     return out
 
+
 def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
     pred = pred.astype(bool)
     gt = gt.astype(bool)
@@ -142,11 +146,47 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
     union = np.logical_or(pred, gt).sum()
     return float(inter / union) if union > 0 else 0.0
 
-def masks_from_ultralytics(result):
+
+def masks_from_ultralytics(result) -> Optional[np.ndarray]:
+    # returns HxW uint8 mask (0/1) or None
     if result.masks is None or result.masks.data is None:
         return None
-    m = result.masks.data.cpu().numpy()
+    m = result.masks.data.cpu().numpy()  # (N, H, W)
     return (m.sum(axis=0) > 0).astype(np.uint8)
+
+
+def confidence_from_result(result) -> Optional[float]:
+    # quick summary confidence: max box confidence if exists
+    try:
+        if result.boxes is None or result.boxes.conf is None:
+            return None
+        confs = result.boxes.conf.detach().cpu().numpy()
+        if confs.size == 0:
+            return None
+        return float(confs.max())
+    except Exception:
+        return None
+
+
+def read_gt_mask_as_binary(gt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+    """
+    Reads GT mask image, converts to binary, and resizes to match pred mask.
+    target_hw: (H, W)
+    """
+    gt_img = Image.open(io.BytesIO(gt_bytes)).convert("L")
+
+    # Resize with NEAREST to avoid destroying labels
+    if gt_img.size != (target_hw[1], target_hw[0]):
+        gt_img = gt_img.resize((target_hw[1], target_hw[0]), resample=Image.NEAREST)
+
+    gt_arr = np.array(gt_img)
+
+    # Robust binarization:
+    # If mask is inverted (lesion=0, background=255), user should fix input,
+    # but we can still threshold normally here.
+    gt_bin = (gt_arr > 127).astype(np.uint8)
+    return gt_bin
+
 
 # ======================================================
 # ROUTES
@@ -160,11 +200,13 @@ def health():
         "model_error": model_error,
     }
 
+
 @app.post("/api/predict")
 async def predict(
     file: UploadFile = File(...),
     gt_mask: Optional[UploadFile] = File(None),
     filename: str = Form("input"),
+    include_images: bool = Query(False, description="Return base64 PNGs if true"),
 ):
     global model
 
@@ -173,13 +215,10 @@ async def predict(
 
     if model is None:
         return JSONResponse(
-            {"error": f"Model not available: {model_error}"},
+            {"status": "error", "error": f"Model not available: {model_error}"},
             status_code=503,
         )
 
-    # ----------------------------
-    # Read input image
-    # ----------------------------
     raw = await file.read()
     name = (file.filename or filename or "input").lower()
 
@@ -188,64 +227,34 @@ async def predict(
     else:
         img_pil = read_png_like(raw)
 
-    img_np = np.array(img_pil)
+    img_np = np.array(img_pil)  # HxWx3
 
-    # ----------------------------
-    # Inference
-    # ----------------------------
     try:
         res = model(img_np, conf=CONF_THRES, verbose=False)[0]
     except Exception as e:
-        return JSONResponse(
-            {"error": f"Inference failed: {e}"},
-            status_code=500,
-        )
+        return JSONResponse({"status": "error", "error": f"Inference failed: {e}"}, status_code=500)
 
-    # ----------------------------
-    # Prediction mask
-    # ----------------------------
     pred_mask = masks_from_ultralytics(res)
     if pred_mask is None:
         pred_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
 
-    pred_overlay = overlay_mask(img_np, pred_mask)
+    conf = confidence_from_result(res)
 
-    # ----------------------------
-    # Base response (ALWAYS JSON)
-    # ----------------------------
-    payload = {
+    payload: Dict[str, Any] = {
         "filename": file.filename or filename,
-        "has_gt": False,
-        "confidence": float(
-            res.boxes.conf.mean().item()
-        ) if res.boxes is not None and res.boxes.conf is not None and len(res.boxes) > 0 else 0.0,
+        "has_gt": gt_mask is not None,
+        "confidence": conf,
         "iou": None,
-        "input_png": pil_to_b64_png(Image.fromarray(img_np)),
-        "pred_overlay_png": pil_to_b64_png(Image.fromarray(pred_overlay)),
     }
 
-    # ----------------------------
-    # Ground truth evaluation (OPTIONAL)
-    # ----------------------------
     if gt_mask is not None:
         gt_raw = await gt_mask.read()
-        try:
-            gt_img = Image.open(io.BytesIO(gt_raw)).convert("L")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid GT mask image")
+        gt_bin = read_gt_mask_as_binary(gt_raw, target_hw=pred_mask.shape)
+        payload["iou"] = compute_iou(pred_mask, gt_bin)
 
-        gt_arr = (np.array(gt_img) > 127).astype(np.uint8)
-
-        if gt_arr.shape != pred_mask.shape:
-            gt_img = gt_img.resize((pred_mask.shape[1], pred_mask.shape[0]))
-            gt_arr = (np.array(gt_img) > 127).astype(np.uint8)
-
-        payload["has_gt"] = True
-        payload["iou"] = compute_iou(pred_mask, gt_arr)
-        payload["gt_overlay_png"] = pil_to_b64_png(
-            Image.fromarray(
-                overlay_mask(img_np, gt_arr, color=(0, 180, 255), alpha=0.35)
-            )
-        )
+    if include_images:
+        pred_overlay = overlay_mask(img_np, pred_mask)
+        payload["input_png"] = pil_to_b64_png(Image.fromarray(img_np))
+        payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(pred_overlay))
 
     return payload
