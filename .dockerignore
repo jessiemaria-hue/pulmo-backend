@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.DS_Store
+node_modules
+frontend
+backend/.venv
+*.pt
+*.pth
+*.onnx
+runs
+data
+datasetsx
