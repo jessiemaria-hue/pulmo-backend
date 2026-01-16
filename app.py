@@ -205,13 +205,20 @@ def read_gt_mat_as_binary(gt_mat_bytes: bytes, target_hw: tuple[int, int]) -> np
     H, W = target_hw
     m = loadmat(io.BytesIO(gt_mat_bytes))
 
-    candidate = None
-    for k, v in m.items():
-        if k.startswith("__"):
-            continue
-        if isinstance(v, np.ndarray) and v.ndim == 2:
-            candidate = v
-            break
+    # Prefer explicit key if exists
+    if "Mask" in m:
+        candidate = m["Mask"]
+    elif "mask" in m:
+        candidate = m["mask"]
+    else:
+        # fallback: first 2D array
+        candidate = None
+        for k, v in m.items():
+            if k.startswith("__"):
+                continue
+            if isinstance(v, np.ndarray) and v.ndim == 2:
+                candidate = v
+                break
 
     if candidate is None:
         raise HTTPException(status_code=400, detail="MAT read failed: no 2D mask found")
@@ -222,6 +229,7 @@ def read_gt_mat_as_binary(gt_mat_bytes: bytes, target_hw: tuple[int, int]) -> np
         gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
 
     return gt
+
 
 # ======================================================
 # ROUTES
