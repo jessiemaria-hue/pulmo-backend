@@ -295,7 +295,12 @@ async def predict(
     gt_bin = None
 
     if gt_mask:
-        gt_bin = read_gt_mask_as_binary(await gt_mask.read(), pred_mask.shape)
+        name = (gt_mask.filename or "").lower()
+        data = await gt_mask.read()
+        if name.endswith(".mat"):
+            gt_bin = read_gt_mat_as_binary(data, pred_mask.shape)
+        else:
+            gt_bin = read_gt_mask_as_binary(data, pred_mask.shape)
     elif gt_txt:
         gt_bin = read_gt_txt_yolo_seg_as_binary(await gt_txt.read(), pred_mask.shape)
     elif gt_mat:
