@@ -52,7 +52,7 @@ model: Optional[YOLO] = None
 model_error: Optional[str] = None
 
 # ======================================================
-# MODEL LOADING (SAFE)
+# MODEL LOADING
 # ======================================================
 
 def load_model():
@@ -113,6 +113,7 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
         intercept = float(getattr(ds, "RescaleIntercept", 0.0))
         arr = arr * slope + intercept
 
+        # windowing (match training)
         p1, p99 = np.percentile(arr, (1, 99))
         arr = np.clip(arr, p1, p99)
 
@@ -121,7 +122,6 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
 
         rgb = np.stack([arr, arr, arr], axis=-1)
         return Image.fromarray(rgb, mode="RGB")
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"DICOM read failed: {e}")
 
@@ -163,12 +163,7 @@ def confidence_from_result(result) -> Optional[float]:
         return None
 
 
-def read_gt_mask_as_binary(gt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    gt_img = Image.open(io.BytesIO(gt_bytes)).convert("L")
-    if gt_img.size != (target_hw[1], target_hw[0]):
-        gt_img = gt_img.resize((target_hw[1], target_hw[0]), Image.NEAREST)
-    return (np.array(gt_img) > 127).astype(np.uint8)
-
+# ---------- GT READERS ----------
 
 def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
     H, W = target_hw
@@ -201,35 +196,55 @@ def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, in
     return mask
 
 
-def read_gt_mat_as_binary(gt_mat_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+def read_gt_mat_slice_as_binary(
+    gt_mat_bytes: bytes,
+    target_hw: tuple[int, int],
+    slice_idx: int,
+) -> np.ndarray:
     H, W = target_hw
     m = loadmat(io.BytesIO(gt_mat_bytes))
 
-    # Prefer explicit key if exists
     if "Mask" in m:
-        candidate = m["Mask"]
+        vol = m["Mask"]
     elif "mask" in m:
-        candidate = m["mask"]
+        vol = m["mask"]
     else:
-        # fallback: first 2D array
-        candidate = None
-        for k, v in m.items():
-            if k.startswith("__"):
-                continue
-            if isinstance(v, np.ndarray) and v.ndim == 2:
-                candidate = v
-                break
+        raise HTTPException(400, "MAT read failed: mask key not found")
 
-    if candidate is None:
-        raise HTTPException(status_code=400, detail="MAT read failed: no 2D mask found")
+    if vol.ndim != 3:
+        raise HTTPException(400, f"Expected 3D mask, got {vol.ndim}D")
 
-    gt = (candidate > 0).astype(np.uint8)
+    if not (0 <= slice_idx < vol.shape[2]):
+        raise HTTPException(400, "slice_idx out of range")
 
-    if gt.shape != (H, W):
-        gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
+    gt2d = (vol[:, :, slice_idx] > 0).astype(np.uint8)
 
-    return gt
+    if gt2d.shape != (H, W):
+        gt2d = cv2.resize(gt2d, (W, H), interpolation=cv2.INTER_NEAREST)
 
+    return gt2d
+
+
+def mask2d_to_yolo_txt(mask: np.ndarray) -> str:
+    H, W = mask.shape
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    lines = []
+    for cnt in contours:
+        if len(cnt) < 3:
+            continue
+        coords = []
+        for p in cnt.squeeze():
+            x = p[0] / (W - 1)
+            y = p[1] / (H - 1)
+            coords.extend([x, y])
+        if coords:
+            lines.append("0 " + " ".join(f"{c:.6f}" for c in coords))
+    return "\n".join(lines)
 
 # ======================================================
 # ROUTES
@@ -246,10 +261,10 @@ def health():
 
 @app.post("/api/predict")
 async def predict(
-    file: UploadFile = File(...),
-    gt_mask: Optional[UploadFile] = File(None),
-    gt_txt: Optional[UploadFile] = File(None),
-    gt_mat: Optional[UploadFile] = File(None),
+    file: UploadFile = File(...),               # .dcm or .png
+    gt_mat: Optional[UploadFile] = File(None),  # MODE B
+    gt_txt: Optional[UploadFile] = File(None),  # MODE A fallback
+    slice_idx: Optional[int] = Query(None),     # REQUIRED for MODE B
     filename: str = Form("input"),
     include_images: bool = Query(False),
 ):
@@ -257,7 +272,6 @@ async def predict(
 
     if model is None:
         load_model()
-
     if model is None:
         return JSONResponse(
             {"status": "error", "error": f"Model not available: {model_error}"},
@@ -267,6 +281,7 @@ async def predict(
     raw = await file.read()
     name = (file.filename or filename or "input").lower()
 
+    # Image ingest
     if name.endswith(".dcm"):
         img_pil = read_dicom_as_rgb(raw)
     else:
@@ -274,6 +289,7 @@ async def predict(
 
     img_np = np.array(img_pil)
 
+    # Inference
     try:
         res = model(img_np, conf=CONF_THRES, verbose=False)[0]
     except Exception as e:
@@ -287,24 +303,37 @@ async def predict(
 
     payload: Dict[str, Any] = {
         "filename": file.filename or filename,
-        "has_gt": any([gt_mask, gt_txt, gt_mat]),
+        "has_gt": bool(gt_mat or gt_txt),
         "confidence": conf,
         "iou": None,
     }
 
     gt_bin = None
 
-    if gt_mask:
-        name = (gt_mask.filename or "").lower()
-        data = await gt_mask.read()
-        if name.endswith(".mat"):
-            gt_bin = read_gt_mat_as_binary(data, pred_mask.shape)
-        else:
-            gt_bin = read_gt_mask_as_binary(data, pred_mask.shape)
+    # MODE B: .dcm + .mat (+ slice_idx)
+    if gt_mat:
+        if slice_idx is None:
+            raise HTTPException(400, "slice_idx is required for gt_mat")
+
+        gt2d = read_gt_mat_slice_as_binary(
+            await gt_mat.read(),
+            pred_mask.shape,
+            slice_idx,
+        )
+
+        yolo_txt = mask2d_to_yolo_txt(gt2d)
+
+        gt_bin = read_gt_txt_yolo_seg_as_binary(
+            yolo_txt.encode(),
+            pred_mask.shape
+        )
+
+    # MODE A: .txt directly
     elif gt_txt:
-        gt_bin = read_gt_txt_yolo_seg_as_binary(await gt_txt.read(), pred_mask.shape)
-    elif gt_mat:
-        gt_bin = read_gt_mat_as_binary(await gt_mat.read(), pred_mask.shape)
+        gt_bin = read_gt_txt_yolo_seg_as_binary(
+            await gt_txt.read(),
+            pred_mask.shape
+        )
 
     if gt_bin is not None:
         payload["iou"] = compute_iou(pred_mask, gt_bin)
