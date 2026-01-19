@@ -2,6 +2,7 @@ import os
 import io
 import base64
 from typing import Optional, Dict, Any
+
 import numpy as np
 import cv2
 from PIL import Image
@@ -30,7 +31,6 @@ HF_REPO_ID = os.getenv("HF_REPO_ID", "")
 HF_FILENAME = os.getenv("HF_FILENAME", "best.pt")
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# Prevent Ultralytics permission issue
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 # ======================================================
@@ -99,7 +99,7 @@ def read_png_like(file_bytes: bytes) -> Image.Image:
     try:
         return Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        raise HTTPException(400, "Invalid image file")
 
 
 def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
@@ -112,7 +112,6 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
         intercept = float(getattr(ds, "RescaleIntercept", 0.0))
         arr = arr * slope + intercept
 
-        # windowing (match training)
         p1, p99 = np.percentile(arr, (1, 99))
         arr = np.clip(arr, p1, p99)
 
@@ -120,9 +119,9 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
         arr = (arr * 255).astype(np.uint8)
 
         rgb = np.stack([arr, arr, arr], axis=-1)
-        return Image.fromarray(rgb, mode="RGB")
+        return Image.fromarray(rgb, "RGB")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"DICOM read failed: {e}")
+        raise HTTPException(400, f"DICOM read failed: {e}")
 
 
 def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(255, 180, 0), alpha=0.35):
@@ -155,45 +154,14 @@ def confidence_from_result(result) -> Optional[float]:
         if result.boxes is None or result.boxes.conf is None:
             return None
         confs = result.boxes.conf.detach().cpu().numpy()
-        if confs.size == 0:
-            return None
-        return float(confs.max())
+        return float(confs.max()) if confs.size else None
     except Exception:
         return None
 
 
-# ---------- GT READERS ----------
-
-def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    H, W = target_hw
-    mask = np.zeros((H, W), dtype=np.uint8)
-
-    text = gt_txt_bytes.decode("utf-8", errors="ignore").strip()
-    if not text:
-        return mask
-
-    for line in text.splitlines():
-        parts = line.strip().split()
-        if len(parts) < 3:
-            continue
-
-        coords = parts[1:]
-        if len(coords) % 2 != 0:
-            continue
-
-        pts = []
-        for i in range(0, len(coords), 2):
-            x = float(coords[i])
-            y = float(coords[i + 1])
-            px = int(round(x * (W - 1)))
-            py = int(round(y * (H - 1)))
-            pts.append([px, py])
-
-        if len(pts) >= 3:
-            cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
-
-    return mask
-
+# ======================================================
+# GT PROCESSING (MODE B)
+# ======================================================
 
 def read_gt_mat_slice_as_binary(
     gt_mat_bytes: bytes,
@@ -203,15 +171,16 @@ def read_gt_mat_slice_as_binary(
     H, W = target_hw
     m = loadmat(io.BytesIO(gt_mat_bytes))
 
-    if "Mask" in m:
-        vol = m["Mask"]
-    elif "mask" in m:
-        vol = m["mask"]
-    else:
-        raise HTTPException(400, "MAT read failed: mask key not found")
+    vol = None
+    for k, v in m.items():
+        if k.startswith("__"):
+            continue
+        if isinstance(v, np.ndarray) and v.ndim == 3:
+            vol = v
+            break
 
-    if vol.ndim != 3:
-        raise HTTPException(400, f"Expected 3D mask, got {vol.ndim}D")
+    if vol is None:
+        raise HTTPException(400, "MAT read failed: no 3D volume found")
 
     if not (0 <= slice_idx < vol.shape[2]):
         raise HTTPException(400, "slice_idx out of range")
@@ -238,12 +207,33 @@ def mask2d_to_yolo_txt(mask: np.ndarray) -> str:
             continue
         coords = []
         for p in cnt.squeeze():
-            x = p[0] / (W - 1)
-            y = p[1] / (H - 1)
-            coords.extend([x, y])
-        if coords:
-            lines.append("0 " + " ".join(f"{c:.6f}" for c in coords))
+            coords.append(p[0] / (W - 1))
+            coords.append(p[1] / (H - 1))
+        lines.append("0 " + " ".join(f"{c:.6f}" for c in coords))
+
     return "\n".join(lines)
+
+
+def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+    H, W = target_hw
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    text = gt_txt_bytes.decode("utf-8", errors="ignore").strip()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        pts = []
+        coords = parts[1:]
+        for i in range(0, len(coords), 2):
+            px = int(float(coords[i]) * (W - 1))
+            py = int(float(coords[i + 1]) * (H - 1))
+            pts.append([px, py])
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [np.array(pts, np.int32)], 1)
+
+    return mask
+
 
 # ======================================================
 # ROUTES
@@ -260,10 +250,10 @@ def health():
 
 @app.post("/api/predict")
 async def predict(
-    file: UploadFile = File(...),               # .dcm or .png
-    gt_mat: Optional[UploadFile] = File(None),  # MODE B
-    gt_txt: Optional[UploadFile] = File(None),  # MODE A fallback
-    slice_idx: Optional[int] = Query(None),     # REQUIRED for MODE B
+    file: UploadFile = File(...),
+    gt_mat: Optional[UploadFile] = File(None),
+    gt_txt: Optional[UploadFile] = File(None),
+    slice_idx: Optional[int] = Query(None),
     filename: str = Form("input"),
     include_images: bool = Query(False),
 ):
@@ -278,25 +268,12 @@ async def predict(
         )
 
     raw = await file.read()
-    name = (file.filename or filename or "input").lower()
+    name = (file.filename or filename).lower()
 
-    # Image ingest
-    if name.endswith(".dcm"):
-        img_pil = read_dicom_as_rgb(raw)
-    else:
-        img_pil = read_png_like(raw)
-
+    img_pil = read_dicom_as_rgb(raw) if name.endswith(".dcm") else read_png_like(raw)
     img_np = np.array(img_pil)
 
-    # Inference
-    try:
-        res = model(img_np, conf=CONF_THRES, verbose=False)[0]
-    except Exception as e:
-        return JSONResponse(
-            {"status": "error", "error": f"Inference failed: {e}"},
-            status_code=500,
-        )
-
+    res = model(img_np, conf=CONF_THRES, verbose=False)[0]
     pred_mask = masks_from_ultralytics(res)
     conf = confidence_from_result(res)
 
@@ -309,7 +286,6 @@ async def predict(
 
     gt_bin = None
 
-    # MODE B: .dcm + .mat (+ slice_idx)
     if gt_mat:
         if slice_idx is None:
             raise HTTPException(400, "slice_idx is required for gt_mat")
@@ -324,22 +300,21 @@ async def predict(
 
         gt_bin = read_gt_txt_yolo_seg_as_binary(
             yolo_txt.encode(),
-            pred_mask.shape
+            pred_mask.shape,
         )
 
-    # MODE A: .txt directly
     elif gt_txt:
         gt_bin = read_gt_txt_yolo_seg_as_binary(
             await gt_txt.read(),
-            pred_mask.shape
+            pred_mask.shape,
         )
 
     if gt_bin is not None:
         payload["iou"] = compute_iou(pred_mask, gt_bin)
 
     if include_images:
-        pred_overlay = overlay_mask(img_np, pred_mask)
+        overlay = overlay_mask(img_np, pred_mask)
         payload["input_png"] = pil_to_b64_png(Image.fromarray(img_np))
-        payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(pred_overlay))
+        payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(overlay))
 
     return payload
