@@ -2,7 +2,6 @@ import os
 import io
 import base64
 from typing import Optional, Dict, Any
-
 import numpy as np
 import cv2
 from PIL import Image
