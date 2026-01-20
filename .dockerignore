@@ -5,10 +5,11 @@ __pycache__
 .DS_Store
 node_modules
 frontend
-backend/.venv
 *.pt
 *.pth
 *.onnx
 runs
 data
-datasetsx
+datasets
+.vscode
+.idea
