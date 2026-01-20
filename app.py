@@ -25,6 +25,7 @@ FRONTEND_ORIGINS = os.getenv(
 ).split(",")
 
 CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))
+YOLO_IMGSZ = 512  # <<< SAMA DENGAN TRAINING
 
 MODEL_DIR = os.getenv("MODEL_DIR", "/tmp/models")
 HF_REPO_ID = os.getenv("HF_REPO_ID", "")
@@ -144,7 +145,7 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
 
 def masks_from_ultralytics(result) -> np.ndarray:
     if result.masks is None or result.masks.data is None:
-        return np.zeros(result.orig_shape, dtype=np.uint8)
+        return np.zeros((YOLO_IMGSZ, YOLO_IMGSZ), dtype=np.uint8)
     m = result.masks.data.cpu().numpy()
     return (m.sum(axis=0) > 0).astype(np.uint8)
 
@@ -160,22 +161,40 @@ def confidence_from_result(result) -> Optional[float]:
 
 
 # ======================================================
-# GT PROCESSING (MODE B)
+# GT READERS (DI RUANG 512)
 # ======================================================
+
+def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes) -> np.ndarray:
+    H = W = YOLO_IMGSZ
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    text = gt_txt_bytes.decode("utf-8", errors="ignore").strip()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        coords = parts[1:]
+        pts = []
+        for i in range(0, len(coords), 2):
+            px = int(float(coords[i]) * (W - 1))
+            py = int(float(coords[i + 1]) * (H - 1))
+            pts.append([px, py])
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [np.array(pts, np.int32)], 1)
+
+    return mask
+
 
 def read_gt_mat_slice_as_binary(
     gt_mat_bytes: bytes,
-    target_hw: tuple[int, int],
     slice_idx: int,
 ) -> np.ndarray:
-    H, W = target_hw
+    H = W = YOLO_IMGSZ
     m = loadmat(io.BytesIO(gt_mat_bytes))
 
     vol = None
     for k, v in m.items():
-        if k.startswith("__"):
-            continue
-        if isinstance(v, np.ndarray) and v.ndim == 3:
+        if not k.startswith("__") and isinstance(v, np.ndarray) and v.ndim == 3:
             vol = v
             break
 
@@ -186,10 +205,7 @@ def read_gt_mat_slice_as_binary(
         raise HTTPException(400, "slice_idx out of range")
 
     gt2d = (vol[:, :, slice_idx] > 0).astype(np.uint8)
-
-    if gt2d.shape != (H, W):
-        gt2d = cv2.resize(gt2d, (W, H), interpolation=cv2.INTER_NEAREST)
-
+    gt2d = cv2.resize(gt2d, (W, H), interpolation=cv2.INTER_NEAREST)
     return gt2d
 
 
@@ -210,30 +226,7 @@ def mask2d_to_yolo_txt(mask: np.ndarray) -> str:
             coords.append(p[0] / (W - 1))
             coords.append(p[1] / (H - 1))
         lines.append("0 " + " ".join(f"{c:.6f}" for c in coords))
-
     return "\n".join(lines)
-
-
-def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    H, W = target_hw
-    mask = np.zeros((H, W), dtype=np.uint8)
-
-    text = gt_txt_bytes.decode("utf-8", errors="ignore").strip()
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        pts = []
-        coords = parts[1:]
-        for i in range(0, len(coords), 2):
-            px = int(float(coords[i]) * (W - 1))
-            py = int(float(coords[i + 1]) * (H - 1))
-            pts.append([px, py])
-        if len(pts) >= 3:
-            cv2.fillPoly(mask, [np.array(pts, np.int32)], 1)
-
-    return mask
-
 
 # ======================================================
 # ROUTES
@@ -272,9 +265,13 @@ async def predict(
 
     img_pil = read_dicom_as_rgb(raw) if name.endswith(".dcm") else read_png_like(raw)
     img_np = np.array(img_pil)
+    orig_h, orig_w = img_np.shape[:2]
 
-    res = model(img_np, conf=CONF_THRES, verbose=False)[0]
-    pred_mask = masks_from_ultralytics(res)
+    # ===== RESIZE KE 512 (SESUAI TRAINING) =====
+    img_512 = cv2.resize(img_np, (YOLO_IMGSZ, YOLO_IMGSZ), interpolation=cv2.INTER_LINEAR)
+
+    res = model(img_512, conf=CONF_THRES, verbose=False)[0]
+    pred_mask_512 = masks_from_ultralytics(res)
     conf = confidence_from_result(res)
 
     payload: Dict[str, Any] = {
@@ -284,36 +281,29 @@ async def predict(
         "iou": None,
     }
 
-    gt_bin = None
+    gt_bin_512 = None
 
     if gt_mat:
         if slice_idx is None:
             raise HTTPException(400, "slice_idx is required for gt_mat")
 
-        gt2d = read_gt_mat_slice_as_binary(
-            await gt_mat.read(),
-            pred_mask.shape,
-            slice_idx,
-        )
-
+        gt2d = read_gt_mat_slice_as_binary(await gt_mat.read(), slice_idx)
         yolo_txt = mask2d_to_yolo_txt(gt2d)
-
-        gt_bin = read_gt_txt_yolo_seg_as_binary(
-            yolo_txt.encode(),
-            pred_mask.shape,
-        )
+        gt_bin_512 = read_gt_txt_yolo_seg_as_binary(yolo_txt.encode())
 
     elif gt_txt:
-        gt_bin = read_gt_txt_yolo_seg_as_binary(
-            await gt_txt.read(),
-            pred_mask.shape,
-        )
+        gt_bin_512 = read_gt_txt_yolo_seg_as_binary(await gt_txt.read())
 
-    if gt_bin is not None:
-        payload["iou"] = compute_iou(pred_mask, gt_bin)
+    if gt_bin_512 is not None:
+        payload["iou"] = compute_iou(pred_mask_512, gt_bin_512)
+
+    # ===== OVERLAY DI RESOLUSI ASLI =====
+    pred_mask_orig = cv2.resize(
+        pred_mask_512, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+    )
 
     if include_images:
-        overlay = overlay_mask(img_np, pred_mask)
+        overlay = overlay_mask(img_np, pred_mask_orig)
         payload["input_png"] = pil_to_b64_png(Image.fromarray(img_np))
         payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(overlay))
 
