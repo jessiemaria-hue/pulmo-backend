@@ -1,14 +1,16 @@
 import os
 import io
 import base64
-from typing import Optional, Dict, Any
+import uuid
+import logging
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import cv2
 from PIL import Image
 from scipy.io import loadmat
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,26 +21,32 @@ from huggingface_hub import hf_hub_download
 # CONFIG
 # ======================================================
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("pulmolens")
+
 FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS",
     "https://pulmo-lens.netlify.app"
 ).split(",")
 
 CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))  # set 512 to match training
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))  # 10MB default
 
 MODEL_DIR = os.getenv("MODEL_DIR", "/tmp/models")
 HF_REPO_ID = os.getenv("HF_REPO_ID", "")
 HF_FILENAME = os.getenv("HF_FILENAME", "best.pt")
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# Prevent Ultralytics permission issue
+# Prevent Ultralytics permission issue (Railway)
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
 # ======================================================
 # APP INIT
 # ======================================================
 
-app = FastAPI(title="PulmoLens API")
+app = FastAPI(title="PulmoLens API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,13 +60,14 @@ model: Optional[YOLO] = None
 model_error: Optional[str] = None
 
 # ======================================================
-# MODEL LOADING (SAFE)
+# MODEL LOADING
 # ======================================================
 
 def load_model():
     global model, model_error
     if model is not None:
         return
+
     try:
         if not HF_REPO_ID:
             raise RuntimeError("HF_REPO_ID is not set")
@@ -74,12 +83,12 @@ def load_model():
 
         model = YOLO(model_path)
         model_error = None
-        print("[PulmoLens] Model loaded:", model_path)
+        log.info("[PulmoLens] Model loaded: %s", model_path)
 
     except Exception as e:
         model = None
         model_error = str(e)
-        print("[PulmoLens] Model load failed:", model_error)
+        log.exception("[PulmoLens] Model load failed: %s", model_error)
 
 
 @app.on_event("startup")
@@ -89,6 +98,14 @@ def startup_event():
 # ======================================================
 # UTILITIES
 # ======================================================
+
+def _guard_size(b: bytes, label: str):
+    if len(b) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} too large: {len(b)} bytes (max {MAX_UPLOAD_BYTES})"
+        )
+
 
 def pil_to_b64_png(img: Image.Image) -> str:
     buf = io.BytesIO()
@@ -100,10 +117,13 @@ def read_png_like(file_bytes: bytes) -> Image.Image:
     try:
         return Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        raise HTTPException(status_code=400, detail="Invalid image file (expected PNG/JPG)")
 
 
 def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
+    """
+    Minimal DICOM -> 8-bit RGB conversion. Matches your training-style normalization (percentile clipping).
+    """
     try:
         import pydicom
         ds = pydicom.dcmread(io.BytesIO(file_bytes), force=True)
@@ -126,7 +146,7 @@ def read_dicom_as_rgb(file_bytes: bytes) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"DICOM read failed: {e}")
 
 
-def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(255, 180, 0), alpha=0.35):
+def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(255, 180, 0), alpha=0.35) -> np.ndarray:
     out = rgb.copy()
     m = mask.astype(bool)
     if m.any():
@@ -144,11 +164,22 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
-def masks_from_ultralytics(result) -> np.ndarray:
+def masks_from_ultralytics(result, target_hw: Tuple[int, int]) -> np.ndarray:
+    """
+    Returns a single binary mask. If no mask, returns zeros of target_hw.
+    """
+    H, W = target_hw
     if result.masks is None or result.masks.data is None:
-        return np.zeros(result.orig_shape, dtype=np.uint8)
-    m = result.masks.data.cpu().numpy()
-    return (m.sum(axis=0) > 0).astype(np.uint8)
+        return np.zeros((H, W), dtype=np.uint8)
+
+    m = result.masks.data.detach().cpu().numpy()  # [N, H, W]
+    if m.ndim != 3:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    merged = (m.sum(axis=0) > 0).astype(np.uint8)
+    if merged.shape != (H, W):
+        merged = cv2.resize(merged, (W, H), interpolation=cv2.INTER_NEAREST)
+    return merged
 
 
 def confidence_from_result(result) -> Optional[float]:
@@ -156,21 +187,16 @@ def confidence_from_result(result) -> Optional[float]:
         if result.boxes is None or result.boxes.conf is None:
             return None
         confs = result.boxes.conf.detach().cpu().numpy()
-        if confs.size == 0:
-            return None
-        return float(confs.max())
+        return float(confs.max()) if confs.size else None
     except Exception:
         return None
 
 
-def read_gt_mask_as_binary(gt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    gt_img = Image.open(io.BytesIO(gt_bytes)).convert("L")
-    if gt_img.size != (target_hw[1], target_hw[0]):
-        gt_img = gt_img.resize((target_hw[1], target_hw[0]), Image.NEAREST)
-    return (np.array(gt_img) > 127).astype(np.uint8)
+# ======================================================
+# GT (YOLO POLYGON TXT) -> BINARY MASK @ 512x512
+# ======================================================
 
-
-def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
+def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: Tuple[int, int]) -> np.ndarray:
     H, W = target_hw
     mask = np.zeros((H, W), dtype=np.uint8)
 
@@ -201,39 +227,101 @@ def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: tuple[int, in
     return mask
 
 
-def read_gt_mat_as_binary(gt_mat_bytes: bytes, target_hw: tuple[int, int]) -> np.ndarray:
-    H, W = target_hw
+# ======================================================
+# MAT (3D) -> SLICE 2D @ target size, then optional polygon convert
+# ======================================================
+
+def _pick_volume_3d(mat: Dict[str, Any]) -> np.ndarray:
+    # Prefer common keys first
+    for k in ("Mask", "mask", "GT", "gt", "Label", "label"):
+        v = mat.get(k)
+        if isinstance(v, np.ndarray) and v.ndim == 3:
+            return v
+
+    # Fallback: first 3D array
+    for k, v in mat.items():
+        if k.startswith("__"):
+            continue
+        if isinstance(v, np.ndarray) and v.ndim == 3:
+            return v
+
+    raise HTTPException(status_code=400, detail="MAT read failed: no 3D volume found")
+
+
+def mat_slice_to_binary(
+    gt_mat_bytes: bytes,
+    slice_idx: int,
+    target_hw: Tuple[int, int],
+) -> np.ndarray:
+    """
+    Robust: supports volumes shaped (H,W,S) or (S,H,W) or (H,S,W) etc.
+    Heuristic: choose two axes closest to target H/W as spatial axes; remaining axis is slice.
+    """
+    Ht, Wt = target_hw
     m = loadmat(io.BytesIO(gt_mat_bytes))
+    vol = _pick_volume_3d(m)
 
-    # Prefer explicit key if exists
-    if "Mask" in m:
-        candidate = m["Mask"]
-    elif "mask" in m:
-        candidate = m["mask"]
-    else:
-        # fallback: first 2D array
-        candidate = None
-        for k, v in m.items():
-            if k.startswith("__"):
-                continue
-            if isinstance(v, np.ndarray) and v.ndim == 2:
-                candidate = v
-                break
+    # Find which two axes look like spatial dims (~Ht, ~Wt)
+    dims = list(vol.shape)  # [d0,d1,d2]
+    axis_scores = []
+    for a in range(3):
+        for b in range(a + 1, 3):
+            da, db = dims[a], dims[b]
+            score = abs(da - Ht) + abs(db - Wt)
+            axis_scores.append((score, a, b))
 
-    if candidate is None:
-        raise HTTPException(status_code=400, detail="MAT read failed: no 2D mask found")
+    axis_scores.sort(key=lambda x: x[0])
+    _, ax_h, ax_w = axis_scores[0]
+    ax_s = ({0, 1, 2} - {ax_h, ax_w}).pop()
 
-    gt = (candidate > 0).astype(np.uint8)
+    S = dims[ax_s]
+    if not (0 <= slice_idx < S):
+        raise HTTPException(status_code=400, detail=f"slice_idx out of range (0..{S-1})")
 
-    if gt.shape != (H, W):
-        gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
+    # Move axes to (H, W, S)
+    vol_hw_s = np.moveaxis(vol, (ax_h, ax_w, ax_s), (0, 1, 2))  # (H?, W?, S)
 
-    return gt
+    gt2d = (vol_hw_s[:, :, slice_idx] > 0).astype(np.uint8)
 
+    # Resize to target exactly
+    if gt2d.shape != (Ht, Wt):
+        gt2d = cv2.resize(gt2d, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+
+    return gt2d
+
+
+def mask2d_to_yolo_txt(mask: np.ndarray) -> str:
+    """
+    Converts a 2D binary mask to YOLO polygon txt format.
+    NOTE: This is inherently lossy vs raw MAT mask; use for compatibility only.
+    """
+    H, W = mask.shape
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    lines = []
+    for cnt in contours:
+        if len(cnt) < 3:
+            continue
+        coords = []
+        pts = cnt.squeeze()
+        if pts.ndim != 2 or pts.shape[0] < 3:
+            continue
+        for p in pts:
+            x = float(p[0]) / float(W - 1)
+            y = float(p[1]) / float(H - 1)
+            coords.extend([x, y])
+        if coords:
+            lines.append("0 " + " ".join(f"{c:.6f}" for c in coords))
+    return "\n".join(lines)
 
 # ======================================================
 # ROUTES
 # ======================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
 
 @app.get("/api/health")
 def health():
@@ -241,77 +329,106 @@ def health():
         "status": "ok",
         "model_loaded": model is not None,
         "model_error": model_error,
+        "imgsz": YOLO_IMGSZ,
+        "conf_thres": CONF_THRES,
     }
 
 
 @app.post("/api/predict")
 async def predict(
-    file: UploadFile = File(...),
-    gt_mask: Optional[UploadFile] = File(None),
-    gt_txt: Optional[UploadFile] = File(None),
-    gt_mat: Optional[UploadFile] = File(None),
-    filename: str = Form("input"),
+    file: UploadFile = File(...),               # .dcm or .png/.jpg
+    gt_txt: Optional[UploadFile] = File(None),  # preferred GT for eval (production)
+    gt_mat: Optional[UploadFile] = File(None),  # optional GT source; requires slice_idx
+    slice_idx: Optional[int] = Query(None),     # required if gt_mat provided
     include_images: bool = Query(False),
+    filename: str = Form("input"),
 ):
+    """
+    Production behavior:
+    - Inference always runs at YOLO_IMGSZ x YOLO_IMGSZ (default 512).
+    - IoU is computed in the same space (512) for consistency with training.
+    - Overlay is returned in original resolution (optional).
+    """
     global model
+
+    req_id = str(uuid.uuid4())[:8]
 
     if model is None:
         load_model()
-
     if model is None:
         return JSONResponse(
-            {"status": "error", "error": f"Model not available: {model_error}"},
             status_code=503,
+            content={"status": "error", "error": f"Model not available: {model_error}", "request_id": req_id},
         )
 
     raw = await file.read()
+    _guard_size(raw, "file")
     name = (file.filename or filename or "input").lower()
 
-    if name.endswith(".dcm"):
-        img_pil = read_dicom_as_rgb(raw)
-    else:
-        img_pil = read_png_like(raw)
-
+    # --- ingest image ---
+    img_pil = read_dicom_as_rgb(raw) if name.endswith(".dcm") else read_png_like(raw)
     img_np = np.array(img_pil)
+    orig_h, orig_w = img_np.shape[:2]
 
+    # --- resize to imgsz (match YOLO training/eval space) ---
+    img_512 = cv2.resize(img_np, (YOLO_IMGSZ, YOLO_IMGSZ), interpolation=cv2.INTER_LINEAR)
+
+    # --- inference ---
     try:
-        res = model(img_np, conf=CONF_THRES, verbose=False)[0]
+        # imgsz param keeps ultralytics consistent if it applies internal transforms
+        res = model(img_512, conf=CONF_THRES, imgsz=YOLO_IMGSZ, verbose=False)[0]
     except Exception as e:
-        return JSONResponse(
-            {"status": "error", "error": f"Inference failed: {e}"},
-            status_code=500,
-        )
+        log.exception("[%s] Inference failed", req_id)
+        return JSONResponse(status_code=500, content={"status": "error", "error": f"Inference failed: {e}", "request_id": req_id})
 
-    pred_mask = masks_from_ultralytics(res)
+    pred_mask_512 = masks_from_ultralytics(res, (YOLO_IMGSZ, YOLO_IMGSZ))
     conf = confidence_from_result(res)
 
     payload: Dict[str, Any] = {
+        "request_id": req_id,
         "filename": file.filename or filename,
-        "has_gt": any([gt_mask, gt_txt, gt_mat]),
+        "has_gt": bool(gt_txt or gt_mat),
         "confidence": conf,
         "iou": None,
+        "imgsz": YOLO_IMGSZ,
     }
 
-    gt_bin = None
+    # --- GT handling (IoU computed in 512-space) ---
+    gt_bin_512 = None
 
-    if gt_mask:
-        name = (gt_mask.filename or "").lower()
-        data = await gt_mask.read()
-        if name.endswith(".mat"):
-            gt_bin = read_gt_mat_as_binary(data, pred_mask.shape)
-        else:
-            gt_bin = read_gt_mask_as_binary(data, pred_mask.shape)
-    elif gt_txt:
-        gt_bin = read_gt_txt_yolo_seg_as_binary(await gt_txt.read(), pred_mask.shape)
-    elif gt_mat:
-        gt_bin = read_gt_mat_as_binary(await gt_mat.read(), pred_mask.shape)
+    if gt_txt is not None:
+        gt_bytes = await gt_txt.read()
+        _guard_size(gt_bytes, "gt_txt")
+        gt_bin_512 = read_gt_txt_yolo_seg_as_binary(gt_bytes, (YOLO_IMGSZ, YOLO_IMGSZ))
 
-    if gt_bin is not None:
-        payload["iou"] = compute_iou(pred_mask, gt_bin)
+    elif gt_mat is not None:
+        if slice_idx is None:
+            raise HTTPException(status_code=400, detail="slice_idx is required when gt_mat is provided")
 
+        mat_bytes = await gt_mat.read()
+        _guard_size(mat_bytes, "gt_mat")
+
+        # Read MAT slice -> 2D mask @ 512
+        gt2d_512 = mat_slice_to_binary(mat_bytes, slice_idx=slice_idx, target_hw=(YOLO_IMGSZ, YOLO_IMGSZ))
+
+        # Convert to YOLO polygon then back to mask (compat mode)
+        # NOTE: This is lossy vs direct pixel IoU. Use gt_txt for authoritative evaluation.
+        yolo_txt = mask2d_to_yolo_txt(gt2d_512)
+        gt_bin_512 = read_gt_txt_yolo_seg_as_binary(yolo_txt.encode("utf-8"), (YOLO_IMGSZ, YOLO_IMGSZ))
+
+        payload["slice_idx"] = slice_idx
+        payload["gt_source"] = "mat->poly->mask (lossy)"
+    else:
+        payload["gt_source"] = None
+
+    if gt_bin_512 is not None:
+        payload["iou"] = compute_iou(pred_mask_512, gt_bin_512)
+
+    # --- overlay (optional, in original resolution for UI) ---
     if include_images:
-        pred_overlay = overlay_mask(img_np, pred_mask)
+        pred_mask_orig = cv2.resize(pred_mask_512, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        overlay = overlay_mask(img_np, pred_mask_orig)
         payload["input_png"] = pil_to_b64_png(Image.fromarray(img_np))
-        payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(pred_overlay))
+        payload["pred_overlay_png"] = pil_to_b64_png(Image.fromarray(overlay))
 
     return payload
