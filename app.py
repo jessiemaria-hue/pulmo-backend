@@ -40,7 +40,7 @@ os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 # APP
 # ======================================================
 
-app = FastAPI(title="PulmoLens API", version="1.0.0")
+app = FastAPI(title="PulmoLens API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +64,6 @@ def load_model():
     try:
         if not HF_REPO_ID:
             raise RuntimeError("HF_REPO_ID missing")
-
         os.makedirs(MODEL_DIR, exist_ok=True)
         path = hf_hub_download(
             repo_id=HF_REPO_ID,
@@ -72,11 +71,9 @@ def load_model():
             token=HF_TOKEN if HF_TOKEN else None,
             cache_dir=MODEL_DIR,
         )
-
         model = YOLO(path)
         model_error = None
         log.info("Model loaded: %s", path)
-
     except Exception as e:
         model = None
         model_error = str(e)
@@ -133,6 +130,14 @@ def pick_volume(mat):
                 return v
     raise HTTPException(400,"MAT has no 3D mask")
 
+def auto_slice(vol: np.ndarray, pred_bin: np.ndarray) -> int:
+    best_i, best = 0, 0
+    for i in range(vol.shape[2]):
+        s = np.logical_and(vol[:,:,i]>0, pred_bin>0).sum()
+        if s > best:
+            best, best_i = s, i
+    return best_i
+
 def mat_slice(b: bytes, idx:int, hw):
     vol = pick_volume(loadmat(io.BytesIO(b)))
     Ht,Wt=hw
@@ -145,8 +150,6 @@ def mat_slice(b: bytes, idx:int, hw):
     _,ah,aw=min(pairs)
     as_ = ({0,1,2}-{ah,aw}).pop()
     vol=np.moveaxis(vol,(ah,aw,as_),(0,1,2))
-    if not 0<=idx<vol.shape[2]:
-        raise HTTPException(400,"slice_idx out of range")
     m=(vol[:,:,idx]>0).astype(np.uint8)
     return cv2.resize(m,(Wt,Ht),interpolation=cv2.INTER_NEAREST)
 
@@ -159,14 +162,13 @@ def iou(a,b):
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok","model_loaded":model is not None,"model_error":model_error,"imgsz":YOLO_IMGSZ}
+    return {"status":"ok","model_loaded":model is not None,"imgsz":YOLO_IMGSZ}
 
 @app.post("/api/predict")
 async def predict(
     file: UploadFile = File(...),
     gt_txt: Optional[UploadFile] = File(None),
     gt_mat: Optional[UploadFile] = File(None),
-    slice_idx: Optional[int] = Query(None),
 ):
     if model is None:
         load_model()
@@ -181,17 +183,22 @@ async def predict(
     res=model(img,conf=CONF_THRES,imgsz=YOLO_IMGSZ,verbose=False)[0]
     pred=(res.masks.data.cpu().numpy().sum(0)>0).astype(np.uint8)
 
-    gt=None
+    gt=None; src=None; idx=None
+
     if gt_txt:
         gt=mask_from_yolo(await gt_txt.read(),(YOLO_IMGSZ,YOLO_IMGSZ))
+        src="txt"
+
     elif gt_mat:
-        if slice_idx is None:
-            raise HTTPException(400,"slice_idx required")
-        gt2=mat_slice(await gt_mat.read(),slice_idx,(YOLO_IMGSZ,YOLO_IMGSZ))
-        gt=gt2
+        mat_bytes = await gt_mat.read()
+        vol = pick_volume(loadmat(io.BytesIO(mat_bytes)))
+        idx = auto_slice(vol, pred)
+        gt = mat_slice(mat_bytes, idx, (YOLO_IMGSZ,YOLO_IMGSZ))
+        src="auto_mat_align"
 
     return {
         "confidence": float(res.boxes.conf.max()) if res.boxes else None,
         "iou": iou(pred,gt) if gt is not None else None,
-        "gt_source": "txt" if gt_txt else "mat",
+        "gt_source": src,
+        "slice_idx": idx
     }
