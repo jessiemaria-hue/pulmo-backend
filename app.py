@@ -231,59 +231,23 @@ def read_gt_txt_yolo_seg_as_binary(gt_txt_bytes: bytes, target_hw: Tuple[int, in
 # MAT (3D) -> SLICE 2D @ target size, then optional polygon convert
 # ======================================================
 
-def _pick_volume_3d(mat: Dict[str, Any]) -> np.ndarray:
-    # Prefer common keys first
-    for k in ("Mask", "mask", "GT", "gt", "Label", "label"):
-        v = mat.get(k)
-        if isinstance(v, np.ndarray) and v.ndim == 3:
-            return v
-
-    # Fallback: first 3D array
-    for k, v in mat.items():
-        if k.startswith("__"):
-            continue
-        if isinstance(v, np.ndarray) and v.ndim == 3:
-            return v
-
-    raise HTTPException(status_code=400, detail="MAT read failed: no 3D volume found")
-
-
-def mat_slice_to_binary(
-    gt_mat_bytes: bytes,
-    slice_idx: int,
-    target_hw: Tuple[int, int],
-) -> np.ndarray:
-    """
-    Robust: supports volumes shaped (H,W,S) or (S,H,W) or (H,S,W) etc.
-    Heuristic: choose two axes closest to target H/W as spatial axes; remaining axis is slice.
-    """
-    Ht, Wt = target_hw
+def read_mat_gt_2d(gt_mat_bytes: bytes, slice_idx: int, target_hw: Tuple[int, int]) -> np.ndarray:
     m = loadmat(io.BytesIO(gt_mat_bytes))
-    vol = _pick_volume_3d(m)
 
-    # Find which two axes look like spatial dims (~Ht, ~Wt)
-    dims = list(vol.shape)  # [d0,d1,d2]
-    axis_scores = []
-    for a in range(3):
-        for b in range(a + 1, 3):
-            da, db = dims[a], dims[b]
-            score = abs(da - Ht) + abs(db - Wt)
-            axis_scores.append((score, a, b))
+    if "Mask" not in m:
+        raise HTTPException(400, "MAT has no 'Mask' key")
 
-    axis_scores.sort(key=lambda x: x[0])
-    _, ax_h, ax_w = axis_scores[0]
-    ax_s = ({0, 1, 2} - {ax_h, ax_w}).pop()
+    vol = m["Mask"]
 
-    S = dims[ax_s]
-    if not (0 <= slice_idx < S):
-        raise HTTPException(status_code=400, detail=f"slice_idx out of range (0..{S-1})")
+    if vol.ndim != 3:
+        raise HTTPException(400, f"Expected 3D mask, got {vol.ndim}D")
 
-    # Move axes to (H, W, S)
-    vol_hw_s = np.moveaxis(vol, (ax_h, ax_w, ax_s), (0, 1, 2))  # (H?, W?, S)
+    if not (0 <= slice_idx < vol.shape[2]):
+        raise HTTPException(400, f"slice_idx out of range (0..{vol.shape[2]-1})")
 
-    gt2d = (vol_hw_s[:, :, slice_idx] > 0).astype(np.uint8)
+    gt2d = (vol[:, :, slice_idx] > 0).astype(np.uint8)
 
-    # Resize to target exactly
+    Ht, Wt = target_hw
     if gt2d.shape != (Ht, Wt):
         gt2d = cv2.resize(gt2d, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
 
@@ -409,8 +373,8 @@ async def predict(
         _guard_size(mat_bytes, "gt_mat")
 
         # Read MAT slice -> 2D mask @ 512
-        gt2d_512 = mat_slice_to_binary(mat_bytes, slice_idx=slice_idx, target_hw=(YOLO_IMGSZ, YOLO_IMGSZ))
-
+        gt2d_512 = read_mat_gt_2d(mat_bytes, slice_idx, (YOLO_IMGSZ, YOLO_IMGSZ))
+        
         # Convert to YOLO polygon then back to mask (compat mode)
         # NOTE: This is lossy vs direct pixel IoU. Use gt_txt for authoritative evaluation.
         yolo_txt = mask2d_to_yolo_txt(gt2d_512)
